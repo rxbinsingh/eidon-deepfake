@@ -171,25 +171,43 @@ def preprocess_video(
 ) -> dict:
     """
     Full preprocessing pipeline for a single video.
+    
+    DUAL-INPUT: extracts both face crops AND full frames.
+    If face detection fails, face_crops will be empty but full_frames still valid.
 
     Returns dict with:
-        anchor_frames   : list of face crops (224×224 BGR) from first n_anchor frames
-        anchor_embeddings: list of ArcFace embeddings (512-dim) from anchor frames
-        video_frames    : list of face crops (224×224 BGR) from num_frames evenly spaced
+        face_crops      : list of face crops (224×224 BGR) — empty if no face detected
+        full_frames     : list of full frames resized to (224×224 BGR) — always available
+        anchor_embeddings: list of ArcFace embeddings from anchor frames
         video_embeddings: list of ArcFace embeddings from video frames
-        raw_frames      : list of full BGR frames (for MediaPipe landmarks)
-        valid           : bool — False if too few faces detected
+        valid           : bool — True if at least full_frames were extracted
+        face_valid      : bool — True if face detection succeeded
     """
     result = {
+        "face_crops": [],
+        "full_frames": [],
         "anchor_frames": [],
         "anchor_embeddings": [],
         "video_frames": [],
         "video_embeddings": [],
         "raw_frames": [],
         "valid": False,
+        "face_valid": False,
     }
 
-    # Anchor frames
+    # Extract frames
+    video_raw = extract_frames(video_path, num_frames=num_frames)
+    if len(video_raw) < 4:
+        return result
+
+    # Full frames (always available — no face detection needed)
+    for frame in video_raw:
+        resized = cv2.resize(frame, (224, 224))
+        result["full_frames"].append(resized)
+
+    result["valid"] = True  # We have full frames at minimum
+
+    # Face crops (may fail for full-body/scene videos)
     anchor_raw = extract_anchor_frames(video_path, n_anchor=n_anchor)
     for frame in anchor_raw:
         crop, emb = detect_face_with_landmarks(frame)
@@ -197,20 +215,16 @@ def preprocess_video(
             result["anchor_frames"].append(crop)
             result["anchor_embeddings"].append(emb)
 
-    if len(result["anchor_frames"]) < 3:
-        return result  # not enough faces detected
-
-    # Video frames
-    video_raw = extract_frames(video_path, num_frames=num_frames)
     for frame in video_raw:
         crop, emb = detect_face_with_landmarks(frame)
         if crop is not None:
+            result["face_crops"].append(crop)
             result["video_frames"].append(crop)
             result["video_embeddings"].append(emb)
             result["raw_frames"].append(frame)
 
-    if len(result["video_frames"]) < 4:
-        return result  # not enough faces detected
+    # Face detection succeeded if we got at least 4 face crops
+    if len(result["face_crops"]) >= 4:
+        result["face_valid"] = True
 
-    result["valid"] = True
     return result

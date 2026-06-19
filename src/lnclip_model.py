@@ -121,18 +121,27 @@ class SphericalAugmentation(nn.Module):
 class LNCLIPDeepfakeDetector(nn.Module):
     """
     LayerNorm-tuned CLIP ViT-L/14 for Deepfake Detection.
-
-    Only LayerNorm parameters in the last N transformer layers are trainable.
-    Everything else (attention, MLP, embeddings) stays frozen.
-
-    This preserves CLIP's pretrained knowledge while allowing subtle
-    task-specific adaptation through normalization statistics.
+    
+    DUAL-INPUT architecture:
+      Path A: Face crop (224×224) — catches face-level artifacts
+      Path B: Full frame (224×224) — catches body/scene/context artifacts
+    
+    Both paths use the SAME CLIP encoder (shared weights).
+    Combined embedding: [768 face + 768 frame] = 1536-dim → classifier.
+    
+    This handles:
+      - Face-swap (detected via face crop path)
+      - Expression transfer (detected via face crop path)
+      - Full-body GAN (detected via full frame path — no face detection needed)
+      - Background manipulation (detected via full frame path)
+    
+    If face detection fails, face path gets zeros and full frame carries detection.
     """
 
     def __init__(
         self,
         clip_model,
-        num_trainable_layers: int = 6,  # tune LN in last 6 layers (18-23)
+        num_trainable_layers: int = 6,
         arc_scale: float = 30.0,
         arc_margin: float = 0.3,
         sphere_noise: float = 0.05,
@@ -141,6 +150,7 @@ class LNCLIPDeepfakeDetector(nn.Module):
 
         self.visual = clip_model.visual
         self.embed_dim = 768  # ViT-L/14 output dimension
+        self.combined_dim = 768 * 2  # face + frame = 1536
 
         # Freeze everything
         for param in self.visual.parameters():
@@ -153,7 +163,6 @@ class LNCLIPDeepfakeDetector(nn.Module):
         trainable_count = 0
         for i, block in enumerate(self.visual.transformer.resblocks):
             if i >= start_layer:
-                # Unfreeze LayerNorm parameters only
                 for name, param in block.named_parameters():
                     if 'ln_' in name or 'norm' in name.lower():
                         param.requires_grad = True
@@ -165,56 +174,64 @@ class LNCLIPDeepfakeDetector(nn.Module):
                 param.requires_grad = True
                 trainable_count += param.numel()
 
-        print(f"[LNCLIP] Trainable parameters: {trainable_count:,} "
+        print(f"[LNCLIP] Trainable LN parameters: {trainable_count:,} "
               f"({trainable_count / sum(p.numel() for p in self.visual.parameters()) * 100:.3f}%)")
 
         # Spherical augmentation
         self.sphere_aug = SphericalAugmentation(noise_std=sphere_noise)
 
-        # Angular margin classifier
+        # Angular margin classifier — input is 1536 (face 768 + frame 768)
         self.classifier = ArcMarginProduct(
-            in_features=self.embed_dim,
+            in_features=self.combined_dim,
             num_classes=2,
             scale=arc_scale,
             margin=arc_margin,
         )
 
-    def encode_frames(self, crops: torch.Tensor) -> torch.Tensor:
+    def encode_frames(self, face_crops: torch.Tensor, full_frames: torch.Tensor) -> torch.Tensor:
         """
-        Encode face crops through CLIP visual encoder.
+        Dual-path encoding: face crops + full frames through shared CLIP.
 
         Args:
-            crops: (B, T, C, H, W) face crops from T frames
+            face_crops:  (B, T, C, H, W) face crops (224×224), zeros if detection failed
+            full_frames: (B, T, C, H, W) full frames resized to 224×224
 
         Returns:
-            (B, embed_dim) L2-normalized video embedding on unit sphere
+            (B, 1536) L2-normalized combined embedding on unit sphere
         """
-        B, T, C, H, W = crops.shape
-        frames = crops.view(B * T, C, H, W)
+        B, T, C, H, W = face_crops.shape
 
-        # Forward through CLIP visual encoder
-        frame_embs = self.visual(frames)  # (B*T, 768)
+        # Path A: Face crops
+        face_flat = face_crops.view(B * T, C, H, W)
+        face_embs = self.visual(face_flat)  # (B*T, 768)
+        face_embs = face_embs.view(B, T, -1).mean(dim=1)  # (B, 768)
 
-        # Temporal mean pooling
-        frame_embs = frame_embs.view(B, T, -1)  # (B, T, 768)
-        video_emb = frame_embs.mean(dim=1)  # (B, 768)
+        # Path B: Full frames
+        frame_flat = full_frames.view(B * T, C, H, W)
+        frame_embs = self.visual(frame_flat)  # (B*T, 768)
+        frame_embs = frame_embs.view(B, T, -1).mean(dim=1)  # (B, 768)
+
+        # Combine: concatenate face + frame
+        combined = torch.cat([face_embs, frame_embs], dim=-1)  # (B, 1536)
 
         # L2 normalize to unit hypersphere
-        video_emb = F.normalize(video_emb.float(), dim=-1)
+        combined = F.normalize(combined.float(), dim=-1)
 
-        return video_emb
+        return combined
 
-    def forward(self, crops: torch.Tensor, labels: Optional[torch.Tensor] = None):
+    def forward(self, face_crops: torch.Tensor, full_frames: torch.Tensor,
+                labels: Optional[torch.Tensor] = None):
         """
         Args:
-            crops: (B, T, C, H, W) face crops
+            face_crops:  (B, T, C, H, W) face crops
+            full_frames: (B, T, C, H, W) full frames
             labels: (B,) integer labels (0=real, 1=fake). None for inference.
 
         Returns:
             logits: (B, 2) class logits
-            embeddings: (B, 768) L2-normalized embeddings (for analysis)
+            embeddings: (B, 1536) L2-normalized combined embeddings
         """
-        embeddings = self.encode_frames(crops)
+        embeddings = self.encode_frames(face_crops, full_frames)
 
         # Apply spherical augmentation during training
         aug_embeddings = self.sphere_aug(embeddings)
@@ -224,11 +241,11 @@ class LNCLIPDeepfakeDetector(nn.Module):
 
         return logits, embeddings
 
-    def predict(self, crops: torch.Tensor) -> torch.Tensor:
+    def predict(self, face_crops: torch.Tensor, full_frames: torch.Tensor) -> torch.Tensor:
         """Inference: returns P(fake) for each video."""
         self.eval()
         with torch.no_grad():
-            logits, _ = self.forward(crops, labels=None)
+            logits, _ = self.forward(face_crops, full_frames, labels=None)
             probs = F.softmax(logits, dim=-1)
             return probs[:, 1]  # P(fake)
 
@@ -242,7 +259,7 @@ def build_lnclip_model(
     arc_margin: float = 0.3,
     sphere_noise: float = 0.05,
 ):
-    """Build the LNCLIP-DF model with frozen CLIP + trainable LayerNorms."""
+    """Build the dual-input LNCLIP-DF model with frozen CLIP + trainable LayerNorms."""
     import open_clip
 
     clip_model, _, preprocess = open_clip.create_model_and_transforms(
