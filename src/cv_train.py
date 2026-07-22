@@ -20,7 +20,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score, accuracy_score
-from sklearn.model_selection import StratifiedKFold, StratifiedGroupKFold
+from sklearn.model_selection import (StratifiedKFold, StratifiedGroupKFold,
+                                     GroupShuffleSplit, StratifiedShuffleSplit)
 
 from src.attn_head import DeepfakeHead
 
@@ -100,7 +101,7 @@ def train_one_fold(bank, train_idx, val_idx, device, cfg):
 DEFAULT_CFG = dict(
     epochs=60, patience=12, batch_size=32, lr=3e-4, weight_decay=1e-2,
     dropout=0.3, hidden=256, heads=4, noise_frac=0.1, frame_drop=0.1,
-    label_smoothing=0.05, tta=True, seed=42, n_splits=5,
+    label_smoothing=0.05, tta=True, seed=42, n_splits=5, val_frac=0.15,
 )
 
 
@@ -122,24 +123,37 @@ def run_cv(bank, device="cuda", cfg=None, groups=None, save_dir=None):
 
     print(f"Cross-validation: {split_kind}\n")
     oof_probs = np.zeros(n, dtype=np.float64)
-    fold_aucs, models = [], []
+    fold_aucs, train_aucs, models = [], [], []
+    groups_arr = np.asarray(groups) if groups is not None else None
 
     for fold, (tr, va) in enumerate(split, 1):
-        model, best = train_one_fold(
-            bank, torch.tensor(tr), torch.tensor(va), device, cfg)
+        # Nested split: carve the early-stopping val set out of TRAIN so the test
+        # fold (va) is never used for model selection (no optimistic bias).
+        if groups_arr is not None:
+            inner = GroupShuffleSplit(n_splits=1, test_size=cfg["val_frac"], random_state=cfg["seed"])
+            i_tr, i_va = next(inner.split(tr, groups=groups_arr[tr]))
+        else:
+            inner = StratifiedShuffleSplit(n_splits=1, test_size=cfg["val_frac"], random_state=cfg["seed"])
+            i_tr, i_va = next(inner.split(tr, y[tr]))
+        tr_inner, va_inner = tr[i_tr], tr[i_va]
+
+        model, _ = train_one_fold(bank, torch.tensor(tr_inner), torch.tensor(va_inner), device, cfg)
         oof_probs[va] = _predict(model, bank, torch.tensor(va).to(device), device, tta=cfg["tta"])
         fold_auc = roc_auc_score(y[va], oof_probs[va])
-        fold_aucs.append(fold_auc)
-        models.append(model)
-        print(f"  Fold {fold}/{cfg['n_splits']}: val AUC = {fold_auc:.4f}  (best-epoch {best:.4f})")
+        tr_auc = roc_auc_score(y[tr_inner], _predict(model, bank, torch.tensor(tr_inner).to(device), device, tta=False))
+        fold_aucs.append(fold_auc); train_aucs.append(tr_auc); models.append(model)
+        print(f"  Fold {fold}/{cfg['n_splits']}: test AUC = {fold_auc:.4f}   "
+              f"(train {tr_auc:.4f}, gap {tr_auc-fold_auc:+.4f})")
 
     oof_auc = roc_auc_score(y, oof_probs)
     oof_acc = accuracy_score(y, (oof_probs > 0.5).astype(int))
     mean, std = float(np.mean(fold_aucs)), float(np.std(fold_aucs))
+    train_mean = float(np.mean(train_aucs))
 
     print(f"\n{'='*52}")
     print(f"  OOF AUC:        {oof_auc:.4f}   (baseline 0.9535, delta {oof_auc-0.9535:+.4f})")
     print(f"  Fold AUC:       {mean:.4f} +/- {std:.4f}")
+    print(f"  Train AUC:      {train_mean:.4f}   (train-OOF gap {train_mean-oof_auc:+.4f} <- overfitting check)")
     print(f"  OOF Accuracy:   {oof_acc:.4f}")
     print(f"{'='*52}")
 
@@ -160,6 +174,7 @@ def run_cv(bank, device="cuda", cfg=None, groups=None, save_dir=None):
         "oof_auc": round(oof_auc, 4), "oof_accuracy": round(oof_acc, 4),
         "fold_auc_mean": round(mean, 4), "fold_auc_std": round(std, 4),
         "fold_aucs": [round(a, 4) for a in fold_aucs],
+        "train_auc_mean": round(train_mean, 4), "train_oof_gap": round(train_mean - oof_auc, 4),
         "per_category_auc": per_cat, "baseline_auc": 0.9535,
         "delta": round(oof_auc - 0.9535, 4), "split_kind": split_kind, "config": cfg,
     }
