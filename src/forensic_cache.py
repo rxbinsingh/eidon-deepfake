@@ -71,6 +71,27 @@ def _process_one(vp, label, pixel_cache_dir, forensic_dir, overwrite, retries=3,
     return "failed"
 
 
+def compute_forensic_stats(forensic_dir):
+    """Per-dim mean/std over all cached forensic frames (face+full), matching the
+    standardization EmbeddingBank applies. Used to standardize new videos at
+    inference identically to training."""
+    forensic_dir = Path(forensic_dir)
+    blocks = []
+    for p in sorted(forensic_dir.glob("*.npz")):
+        d = np.load(p)
+        blocks.append(d["face"].astype(np.float32).reshape(-1, FORENSIC_DIM))
+        blocks.append(d["full"].astype(np.float32).reshape(-1, FORENSIC_DIM))
+    allf = np.concatenate(blocks, axis=0)
+    return allf.mean(0), allf.std(0) + 1e-6
+
+
+def save_forensic_stats(forensic_dir, out_path):
+    mu, sd = compute_forensic_stats(forensic_dir)
+    np.savez(out_path, mu=mu, sd=sd)
+    print(f"[forensic_stats] saved mean/std ({FORENSIC_DIM}-d) to {out_path}")
+    return mu, sd
+
+
 def build_forensic_cache(samples, pixel_cache_dir, forensic_dir, overwrite=False):
     pixel_cache_dir = Path(pixel_cache_dir)
     forensic_dir = Path(forensic_dir)
