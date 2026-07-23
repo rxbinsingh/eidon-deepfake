@@ -54,7 +54,8 @@ def _predict(model, bank, idx, device, tta=True):
 def train_one_fold(bank, train_idx, val_idx, device, cfg):
     """Train a head on train_idx, early-stopping on val AUC. Returns (model, best_auc)."""
     torch.manual_seed(cfg["seed"])
-    model = DeepfakeHead(hidden=cfg["hidden"], heads=cfg["heads"], dropout=cfg["dropout"]).to(device)
+    dim = getattr(bank, "feat_dim", 768)  # 768, or 768+forensic when the forensic stream is on
+    model = DeepfakeHead(dim=dim, hidden=cfg["hidden"], heads=cfg["heads"], dropout=cfg["dropout"]).to(device)
 
     labels = bank.label[train_idx]
     n_real = int((labels == 0).sum()); n_fake = int((labels == 1).sum())
