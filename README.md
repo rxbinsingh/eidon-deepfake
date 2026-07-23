@@ -1,15 +1,33 @@
 # Eidon AI — Deepfake Detection
 
-LNCLIP-DF: LayerNorm-tuned CLIP ViT-L/14 for video deepfake detection with angular margin classification.
+CLIP ViT-L/14 for video deepfake detection with a lightweight attention-pooling
+head trained on cached frozen embeddings, evaluated with leakage-safe grouped
+cross-validation. See [RESULTS.md](RESULTS.md) for the honest numbers and findings.
 
-## Architecture
+## Architecture (current)
 
-- **Backbone:** CLIP ViT-L/14 (OpenAI pretrained)
-- **Tuning:** Only LayerNorm parameters in last 6 transformer layers (0.03% of model)
-- **Loss:** Angular Margin (ArcFace-style) on unit hypersphere
-- **Augmentation:** Compression (JPEG/blur/resize) + spherical noise
-- **Temporal:** Mean pool across 16 face crops per video
-- **Normalization:** L2 → all embeddings on unit sphere
+- **Backbone:** CLIP ViT-L/14 (OpenAI pretrained), **fully frozen** — used as a
+  feature extractor. Freezing preserves generalization on a small (~1k video) set.
+- **Dual-stream input:** 16 frames per video through the same CLIP as (a) the
+  cropped face and (b) the full frame → a 768-d vector per frame per stream.
+- **Head:** attention pooling over frames per stream (learns which frames carry the
+  artifact) + a learned "no-face" vector for detection failures + a small MLP.
+- **Optional forensic stream:** per-frame FFT + SRM/noise descriptors fused with the
+  CLIP streams to add low-level blend/texture sensitivity CLIP lacks.
+- **Fast training:** frozen CLIP features are cached once, so the head trains at
+  ~1 s/epoch (vs ~20 min/epoch recomputing CLIP every epoch).
+
+The earlier LayerNorm-tuned + angular-margin variant (`src/lnclip_model.py`,
+`train.py`) is kept for reference; the frozen-embedding pipeline above is the
+current best and, under honest evaluation, matches it while training ~1000× faster.
+
+## Evaluation
+
+- **Grouped cross-validation** (`src/grouping.py`, `src/cv_train.py`): identity/
+  source groups so a clip's real and its face-swaps never split across folds.
+- **Leave-one-generator-out** (`src/logo_eval.py`): generalization to unseen
+  manipulation families.
+- Honest grouped OOF AUC **0.9428**; see [RESULTS.md](RESULTS.md).
 
 ## Dataset
 
@@ -37,9 +55,17 @@ LNCLIP-DF: LayerNorm-tuned CLIP ViT-L/14 for video deepfake detection with angul
 
 ### Colab (recommended)
 
-Open `notebooks/Train_Colab.ipynb` in Google Colab with T4 GPU.
+Open `notebooks/Train_Fast.ipynb` in Google Colab with a T4 GPU and run the cells
+in order:
 
-### CLI
+1. Install + mount Drive + locate videos
+2. Build the CLIP embedding cache (once; reuses the pixel cache)
+3. Leakage-safe grouped cross-validation
+4. Leave-one-generator-out generalization eval
+5. Regularization sweep
+6. Forensic-stream comparison (CLIP vs CLIP+forensic)
+
+### Legacy CLI (LayerNorm-tuned variant)
 
 ```bash
 python train.py \
