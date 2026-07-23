@@ -93,27 +93,38 @@ def build_embedding_cache(
     stats = {"ok": 0, "skipped": 0, "missing_pixel": 0, "failed": 0}
 
     for vp, label, _cat in tqdm(list(samples), desc="Embedding"):
-        stem = Path(vp).stem
-        out_path = embed_cache_dir / f"{stem}.npz"
-        if out_path.exists() and not overwrite:
-            stats["skipped"] += 1
-            continue
+        result = _process_one(vp, label, pixel_cache_dir, embed_cache_dir, visual, device,
+                              include_flip, overwrite)
+        stats[result] += 1
 
-        pixel_path = pixel_cache_dir / f"{stem}.npz"
-        if not pixel_path.exists():
-            stats["missing_pixel"] += 1
-            continue
+    print(f"[embed_cache] {stats}")
+    return stats
 
+
+def _process_one(vp, label, pixel_cache_dir, embed_cache_dir, visual, device,
+                 include_flip, overwrite, retries=3, retry_wait=2.0):
+    """Process a single video. Retries transient Drive disconnects; never raises.
+
+    Returns one of "skipped", "missing_pixel", "ok", "failed".
+    """
+    import time
+
+    stem = Path(vp).stem
+    out_path = embed_cache_dir / f"{stem}.npz"
+
+    for attempt in range(retries):
         try:
+            if out_path.exists() and not overwrite:
+                return "skipped"
+            pixel_path = pixel_cache_dir / f"{stem}.npz"
+            if not pixel_path.exists():
+                return "missing_pixel"
+
             data = np.load(pixel_path)
             full_frames = data["full_frames"]
             face_valid = bool(data["face_valid"]) if "face_valid" in data else False
             face_crops = data["face_crops"] if ("face_crops" in data and face_valid) else None
-        except Exception:
-            stats["failed"] += 1
-            continue
 
-        try:
             full_batch, n_full = _pad_stack(full_frames)
             if face_crops is not None and len(face_crops) >= 4:
                 face_batch, n_face = _pad_stack(face_crops)
@@ -133,9 +144,14 @@ def build_embedding_cache(
                 record["face_flip"] = _encode(visual, torch.flip(face_batch, [-1]), device).numpy()
 
             np.savez_compressed(out_path, **record)
-            stats["ok"] += 1
+            return "ok"
+        except OSError:
+            # Google Drive FUSE mount hiccup ("Transport endpoint not connected").
+            # Transient — back off and retry rather than aborting the whole cache build.
+            if attempt < retries - 1:
+                time.sleep(retry_wait)
+                continue
+            return "failed"
         except Exception:
-            stats["failed"] += 1
-
-    print(f"[embed_cache] {stats}")
-    return stats
+            return "failed"
+    return "failed"

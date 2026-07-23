@@ -25,23 +25,24 @@ def _pad(frames_uint8, n=NUM_FRAMES):
     return np.stack(feats[:n]), m
 
 
-def build_forensic_cache(samples, pixel_cache_dir, forensic_dir, overwrite=False):
-    pixel_cache_dir = Path(pixel_cache_dir)
-    forensic_dir = Path(forensic_dir)
-    forensic_dir.mkdir(parents=True, exist_ok=True)
-    stats = {"ok": 0, "skipped": 0, "missing_pixel": 0, "failed": 0}
+def _process_one(vp, label, pixel_cache_dir, forensic_dir, overwrite, retries=3, retry_wait=2.0):
+    """Process a single video. Retries transient Drive disconnects; never raises.
 
-    for vp, label, _cat in tqdm(list(samples), desc="Forensic"):
-        stem = Path(vp).stem
-        out = forensic_dir / f"{stem}.npz"
-        if out.exists() and not overwrite:
-            stats["skipped"] += 1
-            continue
-        pix = pixel_cache_dir / f"{stem}.npz"
-        if not pix.exists():
-            stats["missing_pixel"] += 1
-            continue
+    Returns one of "skipped", "missing_pixel", "ok", "failed".
+    """
+    import time
+
+    stem = Path(vp).stem
+    out = forensic_dir / f"{stem}.npz"
+
+    for attempt in range(retries):
         try:
+            if out.exists() and not overwrite:
+                return "skipped"
+            pix = pixel_cache_dir / f"{stem}.npz"
+            if not pix.exists():
+                return "missing_pixel"
+
             d = np.load(pix)
             full = d["full_frames"]
             face_valid = bool(d["face_valid"]) if "face_valid" in d else False
@@ -57,9 +58,28 @@ def build_forensic_cache(samples, pixel_cache_dir, forensic_dir, overwrite=False
                                 full=full_f.astype(np.float16),
                                 n_face=np.int64(n_face), n_full=np.int64(n_full),
                                 label=np.int64(label))
-            stats["ok"] += 1
+            return "ok"
+        except OSError:
+            # Google Drive FUSE mount hiccup ("Transport endpoint not connected").
+            # Transient — back off and retry rather than aborting the whole cache build.
+            if attempt < retries - 1:
+                time.sleep(retry_wait)
+                continue
+            return "failed"
         except Exception:
-            stats["failed"] += 1
+            return "failed"
+    return "failed"
+
+
+def build_forensic_cache(samples, pixel_cache_dir, forensic_dir, overwrite=False):
+    pixel_cache_dir = Path(pixel_cache_dir)
+    forensic_dir = Path(forensic_dir)
+    forensic_dir.mkdir(parents=True, exist_ok=True)
+    stats = {"ok": 0, "skipped": 0, "missing_pixel": 0, "failed": 0}
+
+    for vp, label, _cat in tqdm(list(samples), desc="Forensic"):
+        result = _process_one(vp, label, pixel_cache_dir, forensic_dir, overwrite)
+        stats[result] += 1
 
     print(f"[forensic_cache] {stats}")
     return stats
